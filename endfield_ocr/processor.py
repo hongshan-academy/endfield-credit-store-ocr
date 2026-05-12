@@ -9,13 +9,15 @@ import logging
 import cv2
 import numpy as np
 from pathlib import Path
-from typing import Optional, Iterable, Iterator, Callable, Any, List, Tuple
-
-from endfield_ocr.types import BBox
+from typing import Optional, Iterable, Iterator, Callable, Any, List
 
 from .config import PipelineConfig
-from .models import Slot, Token, ShopResult, ItemResult
-from .backend.paddle import PaddleOCRBackend
+from .models import Token, ShopResult, ItemResult
+from .backend import (
+    OCRBackend, 
+    RemotePaddleOCRBackend, 
+    PaddleOCRBackend
+)
 from .pipeline.detector import detect_card_quads, rectify_by_card_plane
 from .pipeline.slot_builder import build_slots_after_rectification
 from .pipeline.parser import (
@@ -65,7 +67,7 @@ class ShopOCRProcessor:
         
         # Internal state
         self._refs_cache: List[Any] = []
-        self._ocr_backend: Optional[PaddleOCRBackend] = None
+        self._ocr_backend: Optional[OCRBackend] = None
         self._initialized = False
 
     def _ensure_initialized(self) -> None:
@@ -77,15 +79,18 @@ class ShopOCRProcessor:
             self._refs_cache = load_ref_items(self.refs_dir, self.config.recursive_refs)
             
             if self._refs_cache:
-                self.item_names = [ref.name for ref in self._refs_cache]
+                self.item_names.extend([ref.name for ref in self._refs_cache])
                 
         self._initialized = True
 
-    def _get_ocr(self) -> PaddleOCRBackend:
+    def _get_ocr(self) -> OCRBackend:
         """Returns or creates the PaddleOCR backend singleton."""
         if self._ocr_backend is None:
             logger.info("Initializing PaddleOCR backend (lazy load)...")
-            self._ocr_backend = PaddleOCRBackend(self.config.ocr)
+            if self.config.ocr.use_remote_backend:
+                self._ocr_backend = RemotePaddleOCRBackend(self.config.ocr)
+            else:
+                self._ocr_backend = PaddleOCRBackend(self.config.ocr)
             
         return self._ocr_backend
 
@@ -103,7 +108,7 @@ class ShopOCRProcessor:
     
     def _crop_ocr_and_offset(
         self,
-        ocr_backend: "PaddleOCRBackend", 
+        ocr_backend: OCRBackend, 
         rectified: np.ndarray,
         rect: tuple[float, float, float, float],
         source: str,
@@ -166,7 +171,7 @@ class ShopOCRProcessor:
         h_orig, w_orig = img.shape[:2]
 
         # 2. Perspective detection & rectification
-        quads = detect_card_quads(img)
+        quads = detect_card_quads(img, self.config.detection, self.config.debug_save_dir)
         if self.config.debug_save_dir is not None:
             # Draw quads on original image
             quad_boxes = [q["pts"] for q in quads]
@@ -214,12 +219,23 @@ class ShopOCRProcessor:
             full_tokens = ocr.recognize(rectified, source="paddle_full")
             tokens = full_tokens.copy()
             ocr_meta["full_passes"] = 1
+            
+            if self.config.debug_save_dir is not None:
+                vis_crop = draw_boxes(
+                    rectified,
+                    [t.box for t in tokens],
+                    labels=[f"{t.text} ({t.score:.2f})" for t in tokens],
+                    color=(0, 0, 255),
+                    thickness=5,
+                    font_scale=1.0
+                )
+                cv2.imwrite(str(self.config.debug_save_dir / "04_rectified_ocr.png"), vis_crop)
 
             if mode == "fast":
                 # Fast: only full image, plus optional UID/refresh fallback
                 H, W = rectified.shape[:2]
                 uid_roi = default_uid_footer_roi(rectified.shape)
-                if parse_uid(tokens, rectified.shape, uid_roi=uid_roi) is None:
+                if parse_uid(tokens, self.config.uid, rectified.shape, uid_roi=uid_roi) is None:
                     uid_tokens = self._crop_ocr_and_offset(ocr, rectified, uid_roi, "paddle_uid_tiny_roi", pad=5, upscale=3.0)
                     tokens.extend(uid_tokens)
                     ocr_meta["crop_passes"] += 1
@@ -295,10 +311,10 @@ class ShopOCRProcessor:
                 assign_tokens_to_slots(tokens, slots)
                 # Collect fallback rectangles
                 from .pipeline.parser import collect_smart_fallback_rects
-                fallback_rects = collect_smart_fallback_rects(slots, self.item_names, rectified.shape)
+                fallback_rects = collect_smart_fallback_rects(slots, self.item_names, rectified.shape, self.config.roi)
                 # For each fallback rect, do local OCR
                 for x1, y1, x2, y2, src in fallback_rects:
-                    if src == "paddle_uid_tiny_roi" and parse_uid(tokens, rectified.shape) is not None:
+                    if src == "paddle_uid_tiny_roi" and parse_uid(tokens, self.config.uid, rectified.shape) is not None:
                         continue
                     if src == "paddle_footer_refresh" and parse_refresh(tokens) is not None:
                         continue
@@ -324,13 +340,13 @@ class ShopOCRProcessor:
         parsed_items: List[ItemResult] = []
         
         for s in slots:
-            name, name_conf, name_occ = parse_name(s, self.item_names)
-            price, orig_price, price_present = parse_prices(s, self.item_names)
+            name, name_conf, name_occ = parse_name(s, self.item_names, self.config.roi)
+            price, orig_price, price_present = parse_prices(s, self.item_names, self.config.roi)
             
             name_source = "ocr_namebar" if name is not None else None
             match_info = None
             
-            if s.namebar_rect is None and self._refs_cache:
+            if name is None and self._refs_cache:
                 card_bgr = crop_rect_img(rectified, s.rect, pad=2)
                 match_info = match_card_bgr_to_refs(card_bgr, self._refs_cache, name=f"slot_{s.id}")
                 
@@ -351,9 +367,9 @@ class ShopOCRProcessor:
                 price=price, 
                 original_price=orig_price, 
                 price_panel_present=bool(price_present),
-                discount_percent=parse_discount(s),
-                quantity=parse_quantity(s),
-                sold_out=parse_sold_out(s),
+                discount_percent=parse_discount(s, self.config.roi),
+                quantity=parse_quantity(s, self.config.roi),
+                sold_out=parse_sold_out(s, self.config.roi),
             ))
             
 
@@ -367,7 +383,7 @@ class ShopOCRProcessor:
         # 7. Extract global footer metadata (UID, remaining refreshes)
         uid_obj = None
         if tokens:
-            uid_obj = parse_uid(tokens, rectified.shape)
+            uid_obj = parse_uid(tokens, self.config.uid, rectified.shape)
             
         refresh_obj = None
         if tokens:
@@ -379,15 +395,20 @@ class ShopOCRProcessor:
             
         refresh_remaining = None
         refresh_total = None
+        refresh_remaining_time = None
         if refresh_obj is not None:
             refresh_remaining = refresh_obj.get("remaining")
             refresh_total = refresh_obj.get("total")
+            refresh_remaining_time = refresh_obj.get("remaining_time")
+            if refresh_remaining_time is not None:
+                refresh_remaining_time = refresh_remaining_time.get("total_minutes")
 
         return ShopResult(
             image_path=image_path,
             items=parsed_items,
             uid=uid_value,
             refresh_remaining=refresh_remaining,
+            refresh_remaining_time=refresh_remaining_time, 
             refresh_total=refresh_total,
             meta={
                 "original_shape": [h_orig, w_orig],

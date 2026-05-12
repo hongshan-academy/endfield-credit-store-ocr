@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Tuple, Literal, Optional
 
-IMG_EXTS: frozenset = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+IMG_EXTS: frozenset[str] = frozenset({".png", ".jpg", ".jpeg", ".webp", ".bmp"})
 
 @dataclass(frozen=True)
 class ROIConfig(object):
@@ -36,14 +36,14 @@ class UIDConfig(object):
     UID is typically a small, faint numeric string in the bottom-left footer.
     """
     # Minimum and maximum expected UID length. Filters out latency (e.g., "61ms") or price fragments.
-    min_length: int = 5
-    max_length: int = 20
+    min_length: int = 9
+    max_length: int = 10
     # Normalized ratios (left, top, right, bottom) for the initial UID search in the rectified image.
     # Covers the bottom-left 34% width and top 12.5% of the footer area. Converted to absolute pixels at runtime.
     footer_search_ratios: Tuple[float, float, float, float] = (0.0, 0.875, 0.34, 0.995)
 
 @dataclass(frozen=True)
-class DetectionConfig(object):
+class DetectionConfig:
     """
     Parameters for the initial card quadrilateral detection on the raw screenshot/photo.
     Uses contour area, aspect ratio, and spatial constraints to isolate UI cards.
@@ -52,6 +52,8 @@ class DetectionConfig(object):
     card_area_ratio: Tuple[float, float] = (0.004, 0.09)
     # Valid bounding box aspect ratio (width / height). Matches the game's card proportions.
     card_aspect_ratio: Tuple[float, float] = (0.45, 1.35)
+    # Second aspect ratio filter after quadrilateral refinement (stricter).
+    quad_aspect_ratio: Tuple[float, float] = (0.45, 1.25)
     # Minimum horizontal/vertical distance for Non-Maximum Suppression (NMS), relative to the smaller image dimension.
     nms_distance_ratio: float = 0.055
     # Maximum allowed side length for the rectified output image. Prevents OOM during homography warping.
@@ -59,6 +61,22 @@ class DetectionConfig(object):
     # Vertical position constraints to exclude top tabs and bottom navigation buttons.
     exclude_top_ratio: float = 0.10
     exclude_bottom_ratio: float = 0.86
+
+    # Gaussian blur kernel size (must be odd integers)
+    gaussian_blur_kernel: Tuple[int, int] = (5, 5)
+
+    # Two-stage Canny thresholds: (low1, high1) and (low2, high2)
+    canny_thresholds: Tuple[Tuple[int, int], Tuple[int, int]] = ((40, 120), (20, 80))
+
+    # Dilation kernel size for edge enhancement (square kernel)
+    dilation_kernel_size: int = 5
+
+    # Minimum bounding box width/height relative to image dimensions
+    min_bbox_width_ratio: float = 0.035
+    min_bbox_height_ratio: float = 0.075
+
+    # Epsilon factor for Douglas-Peucker polygon approximation (relative to contour perimeter)
+    approx_epsilon_ratio: float = 0.03
 
 @dataclass(frozen=True)
 class SlotConfig(object):
@@ -91,6 +109,17 @@ class OCRConfig(object):
     text_det_unclip_ratio: float = 1.7
     # Number of images processed in a single batch during recognition. Tuned for VRAM/CPU balance.
     text_recognition_batch_size: int = 16
+    
+    # Whether to use remote backend
+    use_remote_backend: bool = False
+    # Remote API token
+    remote_api_token: Optional[str] = None
+    # Max retries when HTTP Error
+    max_retries = 5
+    # Base delay between retries (s)
+    base_delay = 1.0
+    # Requests timeout (s)
+    timeout = 30
 
 @dataclass
 class PipelineConfig(object):

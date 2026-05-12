@@ -1,7 +1,8 @@
 .venv
 
-data/images.zip
 data/images
+data/wicast
+
 .mypy_cache
 
 output

@@ -17,14 +17,6 @@ from ..utils.geometry import (
 )
 from ..config import ROIConfig, UIDConfig
 
-ROI_DISCOUNT = ROIConfig.discount
-ROI_PRICE = ROIConfig.price
-ROI_QUANTITY = ROIConfig.quantity
-ROI_SOLDOUT = ROIConfig.sold_out
-
-UID_MIN_LEN = UIDConfig.min_length
-UID_MAX_LEN = UIDConfig.max_length
-
 
 def assign_tokens_to_slots(tokens: List[Token], slots: List[Slot]) -> None:
     """
@@ -100,7 +92,7 @@ def match_item_name(text: str, item_names: List[str], threshold: float = 68.0) -
         return None, float(score)
 
 
-def parse_name(slot: Slot, item_names: List[str]) -> Tuple[Optional[str], Optional[float], bool]:
+def parse_name(slot: Slot, item_names: List[str], config: ROIConfig) -> Tuple[Optional[str], Optional[float], bool]:
     """
     Extracts item name from the namebar. Falls back to full-slot tokens only if sold-out overlay occludes the namebar.
     Returns (name, confidence, is_occluded_by_soldout).
@@ -122,7 +114,7 @@ def parse_name(slot: Slot, item_names: List[str]) -> Tuple[Optional[str], Option
                 base_score = avg_score * 10.0 + 14.0
                 candidates.append((raw, base_score))
                 
-    is_sold_out = parse_sold_out(slot)
+    is_sold_out = parse_sold_out(slot, config)
     if is_sold_out and not candidates:
         for t in slot.tokens:
             if has_chinese(t.text) and "售" not in t.text:
@@ -145,7 +137,7 @@ def parse_name(slot: Slot, item_names: List[str]) -> Tuple[Optional[str], Option
     return best[0], final_confidence, is_occluded
 
 
-def parse_sold_out(slot: Slot) -> bool:
+def parse_sold_out(slot: Slot, config: ROIConfig) -> bool:
     """Detects sold-out status by checking for specific keywords or high fuzzy ratio in the overlay ROI."""
     joined_text = normalize_text("".join(t.text for t in slot.tokens))
     sold_keywords = ["售罄", "售馨", "已售罄"]
@@ -153,7 +145,7 @@ def parse_sold_out(slot: Slot) -> bool:
         if keyword in joined_text:
             return True
             
-    overlay_tokens = tokens_in_region(slot, ROI_SOLDOUT)
+    overlay_tokens = tokens_in_region(slot, ROIConfig.sold_out)
     all_tokens = overlay_tokens + slot.tokens
     for t in all_tokens:
         cleaned = clean_name(t.text)
@@ -165,9 +157,9 @@ def parse_sold_out(slot: Slot) -> bool:
     return False
 
 
-def parse_discount(slot: Slot) -> Optional[int]:
+def parse_discount(slot: Slot, config: ROIConfig) -> Optional[int]:
     """Extracts discount percentage (1-99) from the top-right discount ROI."""
-    region_tokens = tokens_in_region(slot, ROI_DISCOUNT)
+    region_tokens = tokens_in_region(slot, config.discount)
     scanned_texts: List[str] = []
     for t in region_tokens:
         scanned_texts.append(normalize_num_text(t.text))
@@ -186,9 +178,9 @@ def parse_discount(slot: Slot) -> Optional[int]:
     return None
 
 
-def parse_quantity(slot: Slot) -> Optional[int]:
+def parse_quantity(slot: Slot, config: ROIConfig) -> Optional[int]:
     """Extracts quantity (e.g., x10, x2000) from the center badge ROI."""
-    region_tokens = tokens_in_region(slot, ROI_QUANTITY)
+    region_tokens = tokens_in_region(slot, config.quantity)
     sorted_toks = sorted(region_tokens + slot.tokens, key=lambda t: (t.cy, t.cx))
     
     for t in sorted_toks:
@@ -313,13 +305,13 @@ def _dedupe_numeric_values(cands: List[Tuple[int, Token, str]]) -> List[Tuple[in
     return final
 
 
-def parse_prices(slot: Slot, item_names: List[str]) -> Tuple[Optional[int], Optional[int], bool]:
+def parse_prices(slot: Slot, item_names: List[str], config: ROIConfig) -> Tuple[Optional[int], Optional[int], bool]:
     """
     Extracts current and original prices from the strict bottom-right price ROI.
     Returns (price, original_price, price_panel_present).
     """
     price_tokens: List[Token] = []
-    region_tokens = tokens_in_region(slot, ROI_PRICE)
+    region_tokens = tokens_in_region(slot, config.price)
     
     for t in region_tokens:
         nx, ny = slot.norm_xy(t)
@@ -349,6 +341,7 @@ def parse_prices(slot: Slot, item_names: List[str]) -> Tuple[Optional[int], Opti
 def _is_refresh_anchor_text(s: str) -> bool:
     """Checks if text matches the Chinese anchor for remaining refresh count."""
     cleaned = clean_name(s)
+    # Original patterns for remaining count (X/Y)
     if "剩余次数" in cleaned:
         return True
     if ("剩余" in cleaned and "次" in cleaned) or ("刷新" in cleaned and "次" in cleaned):
@@ -357,17 +350,87 @@ def _is_refresh_anchor_text(s: str) -> bool:
         return True
     if fuzz.partial_ratio(cleaned, "剩余刷新次数") >= 72:
         return True
+    
+    # New patterns for countdown time
+    if "刷新倒计时" in cleaned:
+        return True
+    if "倒计时" in cleaned and ("刷新" in cleaned or "剩余" in cleaned):
+        return True
+    if fuzz.partial_ratio(cleaned, "刷新倒计时") >= 70:
+        return True
+    if fuzz.partial_ratio(cleaned, "倒计时") >= 70 and ("刷新" in cleaned or "剩余" in cleaned):
+        return True
+    
     return False
+
+def _parse_refresh_time_from_text(text: str) -> Optional[Dict[str, Any]]:
+    """
+    Extract refresh countdown (e.g., '5小时53分钟' or '32分钟') from a text string.
+    Tolerates common OCR errors (e.g., '小B时', '分2').
+    Returns dict with keys: hours, minutes, total_minutes, text; or None if not found.
+    """
+    full_text = normalize_text(text)
+
+    # Optional: locate anchor "倒计时" to narrow search area
+    anchor_match = re.search(r'倒计时[:：]', full_text, re.IGNORECASE)
+    if anchor_match:
+        search_text = full_text[anchor_match.end():]
+    else:
+        search_text = full_text
+
+    # 1) Pattern: X小时Y分钟 (hours + minutes)
+    pattern_hm = re.compile(
+        r'(\d{1,2})\s*(?:小?时|hours?)\D*?(\d{1,2})\s*(?:分钟?|minutes?)',
+        re.IGNORECASE
+    )
+    m = pattern_hm.search(search_text)
+    if m:
+        hours = int(m.group(1))
+        minutes = int(m.group(2))
+        if 0 <= hours <= 99 and 0 <= minutes <= 59:
+            return {
+                "hours": hours,
+                "minutes": minutes,
+                "total_minutes": hours * 60 + minutes,
+                "text": f"{hours}小时{minutes}分钟"
+            }
+
+    # 2) Pattern: only minutes (e.g., 32分钟)
+    pattern_minutes_only = re.compile(
+        r'(?<!\d)(\d{1,3})\s*(?:分钟?|minutes?)(?!\d)',
+        re.IGNORECASE
+    )
+    m = pattern_minutes_only.search(search_text)
+    if m:
+        minutes = int(m.group(1))
+        if 0 <= minutes <= 60:
+            return {
+                "hours": 0,
+                "minutes": minutes,
+                "total_minutes": minutes,
+                "text": f"{minutes}分钟"
+            }
+
+    return None
 
 
 def parse_refresh(tokens: List[Token]) -> Optional[Dict[str, Any]]:
-    """Parses remaining/total refresh count by locating the anchor text and extracting X/Y digits."""
+    """
+    Parses remaining/total refresh count (X/Y) and remaining time (countdown) from OCR tokens.
+    Returns dict with keys: remaining, total, remaining_time, text, anchor_text, confidence.
+    For each anchor line: extract time and X/Y. If at least one found, return result.
+    """
     lines = group_tokens_lines(tokens, tol_factor=2.2)
+
     for line in lines:
         raw_text = "".join(t.text for t in sorted(line, key=lambda z: z.cx))
         if not _is_refresh_anchor_text(raw_text):
             continue
-            
+
+        # Extract countdown time from this line (may be None)
+        time_info = _parse_refresh_time_from_text(raw_text)
+
+        # Extract X/Y pattern from this line
         normalized = normalize_num_text(raw_text)
         m = re.search(r"(\d{1,3})\s*/\s*(\d{1,3})", normalized)
         if not m:
@@ -379,19 +442,22 @@ def parse_refresh(tokens: List[Token]) -> Optional[Dict[str, Any]]:
                     break
             tail_text = normalize_num_text("".join(t.text for t in ordered[anchor_index:]))
             m = re.search(r"(\d{1,3})\s*/\s*(\d{1,3})", tail_text)
-            if not m:
-                continue
-                
-        return {
-            "remaining": int(m.group(1)),
-            "total": int(m.group(2)),
-            "text": m.group(0),
-            "anchor_text": raw_text,
-            "confidence": 0.96
-        }
-        
-    return None
 
+        remaining = int(m.group(1)) if m else None
+        total = int(m.group(2)) if m else None
+
+        # If we have at least one piece of information, return it
+        if time_info is not None or remaining is not None:
+            return {
+                "remaining": remaining,
+                "total": total,
+                "remaining_time": time_info,
+                "text": m.group(0) if m else None,
+                "anchor_text": raw_text,
+                "confidence": 0.96 if m else (0.85 if time_info else None)
+            }
+
+    return None
 
 def default_uid_footer_roi(image_shape: Tuple[int, int]) -> Tuple[float, float, float, float]:
     """Returns the narrow bottom-left UID search region in rectified-image coordinates."""
@@ -415,42 +481,42 @@ def _digit_runs(s: str) -> List[str]:
     return re.findall(r"\d+", normalize_num_text(s))
 
 
-def _pick_uid_digits_from_runs(runs: List[str], prefer: str = "first") -> Optional[str]:
+def _pick_uid_digits_from_runs(runs: List[str], config: UIDConfig, prefer: str = "first") -> Optional[str]:
     """Selects one UID-looking digit block without assuming a fixed length."""
     cleaned_runs = [r for r in runs if r]
     if not cleaned_runs:
         return None
         
-    valid_runs = [r for r in cleaned_runs if UID_MIN_LEN <= len(r) <= UID_MAX_LEN]
+    valid_runs = [r for r in cleaned_runs if config.min_length <= len(r) <= config.max_length]
     if valid_runs:
         if prefer != "last":
             return valid_runs[0]
         else:
             return valid_runs[-1]
             
-    long_runs = [r for r in cleaned_runs if len(r) > UID_MAX_LEN]
+    long_runs = [r for r in cleaned_runs if len(r) > config.max_length]
     if long_runs:
         r = long_runs[0] if prefer != "last" else long_runs[-1]
         if prefer == "last":
-            return r[-UID_MAX_LEN:]
+            return r[-config.max_length:]
         else:
-            return r[:UID_MAX_LEN]
+            return r[:config.max_length]
             
     return None
 
 
-def _uid_candidate_digits(s: str, prefer: str = "last") -> Optional[str]:
+def _uid_candidate_digits(s: str, config: UIDConfig, prefer: str = "last") -> Optional[str]:
     """Extracts UID digits from a string, ignoring ratio/percent patterns."""
     s = normalize_num_text(s)
     if "/" in s or "%" in s:
         return None
-    return _pick_uid_digits_from_runs(_digit_runs(s), prefer=prefer)
+    return _pick_uid_digits_from_runs(_digit_runs(s), config, prefer=prefer)
 
 
-def _uid_token_rank(t: Token, uid: str, image_shape: Optional[Tuple[int, int]] = None, uid_roi: Optional[Tuple[float, float, float, float]] = None) -> float:
+def _uid_token_rank(t: Token, uid: str, config: UIDConfig, image_shape: Optional[Tuple[int, int]] = None, uid_roi: Optional[Tuple[float, float, float, float]] = None) -> float:
     """Scores a token's likelihood of being the true UID based on length, position, and ROI containment."""
     score = 0.0
-    if UID_MIN_LEN <= len(uid) <= UID_MAX_LEN:
+    if config.max_length <= len(uid) <= config.max_length:
         score += 0.8
         
     if image_shape is not None:
@@ -477,7 +543,7 @@ def _token_span_rect_horizontal(t: Token, start_frac: float, end_frac: float) ->
     return (sub_x1, y1, sub_x2, y2)
 
 
-def parse_uid(tokens: List[Token], image_shape: Optional[Tuple[int, int]] = None, uid_roi: Optional[Tuple[float, float, float, float]] = None) -> Optional[Dict[str, Any]]:
+def parse_uid(tokens: List[Token], config: UIDConfig, image_shape: Optional[Tuple[int, int]] = None, uid_roi: Optional[Tuple[float, float, float, float]] = None) -> Optional[Dict[str, Any]]:
     """
     Parses UID using a 3-stage fallback strategy:
     1. Anchor + digits in the same token.
@@ -496,7 +562,7 @@ def parse_uid(tokens: List[Token], image_shape: Optional[Tuple[int, int]] = None
             continue
             
         tail = s[anchor_match.end():]
-        uid = _uid_candidate_digits(tail, prefer="first")
+        uid = _uid_candidate_digits(tail, config, prefer="first")
         if uid:
             token_len = max(1, len(s))
             digit_start = s.find(uid, anchor_match.end())
@@ -505,7 +571,7 @@ def parse_uid(tokens: List[Token], image_shape: Optional[Tuple[int, int]] = None
             else:
                 bbox = token_rect(t)
                 
-            rank = _uid_token_rank(t, uid, image_shape, uid_roi)
+            rank = _uid_token_rank(t, uid, config, image_shape, uid_roi)
             single_token_candidates.append((rank, t, uid, tail, bbox))
             
     if single_token_candidates:
@@ -534,7 +600,7 @@ def parse_uid(tokens: List[Token], image_shape: Optional[Tuple[int, int]] = None
                 
             used_tokens = [t]
             pieces: List[str] = []
-            tail_digits = _uid_candidate_digits(s_t[anchor_match.end():], prefer="first")
+            tail_digits = _uid_candidate_digits(s_t[anchor_match.end():], config, prefer="first")
             if tail_digits:
                 pieces.append(tail_digits)
                 
@@ -550,14 +616,14 @@ def parse_uid(tokens: List[Token], image_shape: Optional[Tuple[int, int]] = None
                     break
                     
                 su = normalize_num_text(u.text)
-                d = _uid_candidate_digits(su, prefer="first")
+                d = _uid_candidate_digits(su, config, prefer="first")
                 if d:
                     pieces.append(d)
                     used_tokens.append(u)
                     last_token = u
                     
             uid_joined = "".join(pieces)
-            uid = _pick_uid_digits_from_runs([uid_joined], prefer="first")
+            uid = _pick_uid_digits_from_runs([uid_joined], config, prefer="first")
             if uid:
                 return {
                     "uid": uid,
@@ -569,7 +635,7 @@ def parse_uid(tokens: List[Token], image_shape: Optional[Tuple[int, int]] = None
                     "source": "uid_anchor_plus_digits"
                 }
                 
-            if len(uid_joined) > UID_MAX_LEN:
+            if len(uid_joined) > config.max_length:
                 break
             elif pieces:
                 break
@@ -581,13 +647,13 @@ def parse_uid(tokens: List[Token], image_shape: Optional[Tuple[int, int]] = None
             if not rect_contains_point(uid_roi, t.cx, t.cy, margin=max(6.0, t.h * 1.5)):
                 continue
                 
-            uid = _uid_candidate_digits(t.text, prefer="last")
+            uid = _uid_candidate_digits(t.text, config, prefer="last")
             if not uid:
                 continue
                 
             raw_norm = normalize_num_text(t.text).lower()
             penalty = 0.25 if ("ms" in raw_norm or "/" in raw_norm or "%" in raw_norm) else 0.0
-            rank = 0.65 + _uid_token_rank(t, uid, image_shape, uid_roi) * 0.12 - penalty
+            rank = 0.65 + _uid_token_rank(t, uid, config, image_shape, uid_roi) * 0.12 - penalty
             fallback_candidates.append((rank, t.cx, uid, t))
             
         if fallback_candidates:
@@ -715,6 +781,7 @@ def collect_smart_fallback_rects(
     slots: list[Slot],
     item_names: list[str],
     image_shape: tuple[int, int],
+    config: ROIConfig,
 ) -> list[tuple[float, float, float, float, str]]:
     """
     Determine which local regions need a second OCR pass after the global full-image OCR.
@@ -724,9 +791,9 @@ def collect_smart_fallback_rects(
     H, W = image_shape[:2]
 
     for s in slots:
-        name, _, name_occluded = parse_name(s, item_names)
-        price, _, price_present = parse_prices(s, item_names)
-        sold = parse_sold_out(s)
+        name, _, name_occluded = parse_name(s, item_names, config)
+        price, _, price_present = parse_prices(s, item_names, config)
+        sold = parse_sold_out(s, config)
 
         if s.namebar_rect is not None and name is None and not name_occluded:
             rects.append((*s.namebar_rect, "paddle_namebar"))
@@ -734,7 +801,7 @@ def collect_smart_fallback_rects(
         if price is None and not sold:
             l, t, r, b = s.rect
             sw, sh = r - l, b - t
-            roi = ROI_PRICE  # (0.54, 0.70, 1.02, 0.97)
+            roi = config.price  # (0.54, 0.70, 1.02, 0.97)
             x1 = l + roi[0] * sw
             y1 = t + roi[1] * sh
             x2 = l + roi[2] * sw
